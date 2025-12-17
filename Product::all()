@@ -1,0 +1,16 @@
+[90m= [39m[34;4mIlluminate\Database\Eloquent\Collection[39;24m {#1355
+    [34mall[39m: [
+      [34;4mApp\Models\Appointment[39;24m {#6060
+        [34mid[39m: [35m1[39m,
+        [34mproduct_id[39m: [35m2[39m,
+        [34mcustomer_name[39m: "[32mCliente[39m",
+        [34mcustomer_phone[39m: "[32m+34670876459[39m",
+        [34mstarts_at[39m: "[32m2026-01-22 15:30:00[39m",
+        [34mends_at[39m: "[32m2026-01-22 16:30:00[39m",
+        [34mstatus[39m: "[32mscheduled[39m",
+        [34mcreated_at[39m: "[32m2025-12-17 13:17:55[39m",
+        [34mupdated_at[39m: "[32m2025-12-17 13:17:55[39m",
+      },
+    ],
+  }
+
