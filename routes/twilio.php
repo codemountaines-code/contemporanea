@@ -4,6 +4,8 @@ use Illuminate\Support\Facades\Route;
 use Twilio\Rest\Client;
 use App\Models\Product;
 use App\Models\Appointment;
+use App\Models\CallContext;
+use App\Services\AvailabilityService;
 use Illuminate\Support\Carbon;
 
 // Ruta de prueba para enviar SMS
@@ -43,86 +45,309 @@ Route::get('/twilio-test', function () {
 
 // Voice: llamada entrante
 Route::post('/voice/incoming', function () {
+    $callSid = request('CallSid');
+    $from = request('From');
+    
+    // Crear o recuperar contexto de la llamada
+    $context = CallContext::firstOrCreate(
+        ['call_sid' => $callSid],
+        ['customer_phone' => $from, 'step' => 'welcome']
+    );
+    
     $response = new \Twilio\Twiml();
-    $response->say('Bienvenido a Contemporánea Estética.');
-    $gather = $response->gather(['input' => 'dtmf', 'numDigits' => 1, 'action' => url('/voice/gather')]);
-    $gather->say('Indique la familia del servicio: Presione 1 para faciales, 2 para manos.');
-    $response->say('No se detectó elección.');
+    $response->say('Bienvenido a Contemporánea Estética.', ['language' => 'es']);
+    $gather = $response->gather([
+        'input' => 'dtmf', 
+        'numDigits' => 1, 
+        'action' => url('/voice/gather'),
+        'timeout' => 5
+    ]);
+    $gather->say('Indique la familia del servicio: Presione 1 para tratamientos faciales, 2 para servicios de manos, 0 para repetir.', ['language' => 'es']);
+    $response->say('No se detectó elección. Intentando de nuevo.', ['language' => 'es']);
     $response->redirect(url('/voice/incoming'));
     return response($response)->header('Content-Type', 'text/xml');
 });
 
 // Procesar selección y pedir fecha/hora
 Route::post('/voice/gather', function () {
+    $callSid = request('CallSid');
     $digit = request('Digits');
-    $family = $digit === '1' ? 'facial' : ($digit === '2' ? 'manos' : null);
-
+    
+    $context = CallContext::where('call_sid', $callSid)->first();
+    
     $response = new \Twilio\Twiml();
-    if (!$family) {
-        $response->say('Selección inválida.');
+    
+    if ($digit === '0') {
         $response->redirect(url('/voice/incoming'));
         return response($response)->header('Content-Type', 'text/xml');
     }
+    
+    $family = $digit === '1' ? 'facial' : ($digit === '2' ? 'manos' : null);
 
-    $products = Product::where('family', $family)->where('active', true)->limit(3)->get();
+    if (!$family) {
+        $response->say('Selección inválida. Presione 0 para volver al menú principal.', ['language' => 'es']);
+        $response->redirect(url('/voice/incoming'));
+        return response($response)->header('Content-Type', 'text/xml');
+    }
+    
+    // Guardar familia en contexto
+    $context->update(['family' => $family, 'step' => 'selecting_product']);
+
+    $products = Product::where('family', $family)->where('active', true)->get();
     if ($products->isEmpty()) {
-        $response->say('No hay servicios disponibles en esta familia.');
+        $response->say('No hay servicios disponibles en esta familia.', ['language' => 'es']);
+        $response->hangup();
         return response($response)->header('Content-Type', 'text/xml');
     }
 
-    $response->say('Servicios disponibles.');
+    $response->say('Servicios disponibles:', ['language' => 'es']);
     foreach ($products as $index => $p) {
-        $response->say(($index + 1) . '. ' . $p->name . ' duración ' . $p->duration_minutes . ' minutos.');
+        $priceEuros = number_format($p->price_cents / 100, 2);
+        $response->say(
+            ($index + 1) . '. ' . $p->name . ', duración ' . $p->duration_minutes . ' minutos, precio ' . $priceEuros . ' euros.', 
+            ['language' => 'es']
+        );
     }
-    $gather = $response->gather(['input' => 'dtmf', 'numDigits' => 1, 'action' => url('/voice/product')]);
-    $gather->say('Elija el servicio presionando un número.');
+    $gather = $response->gather([
+        'input' => 'dtmf', 
+        'numDigits' => 1, 
+        'action' => url('/voice/product'),
+        'timeout' => 5
+    ]);
+    $gather->say('Elija el servicio presionando el número correspondiente, o 0 para volver.', ['language' => 'es']);
+    $response->redirect(url('/voice/incoming'));
     return response($response)->header('Content-Type', 'text/xml');
 });
 
 // Elegir producto y pedir fecha/hora
 Route::post('/voice/product', function () {
+    $callSid = request('CallSid');
     $digit = request('Digits');
-    $family = 'facial'; // simplificado: en producción, almacenar en sesión/DB
-    $products = Product::where('family', $family)->where('active', true)->limit(3)->get();
-    $product = $products->get(((int)$digit) - 1);
-
+    
+    $context = CallContext::where('call_sid', $callSid)->first();
+    
     $response = new \Twilio\Twiml();
-    if (!$product) {
-        $response->say('Selección inválida.');
+    
+    if ($digit === '0') {
         $response->redirect(url('/voice/incoming'));
         return response($response)->header('Content-Type', 'text/xml');
     }
+    
+    $products = Product::where('family', $context->family)->where('active', true)->get();
+    $productIndex = ((int)$digit) - 1;
+    
+    if ($productIndex < 0 || $productIndex >= $products->count()) {
+        $response->say('Selección inválida. Presione 0 para volver al menú.', ['language' => 'es']);
+        $response->redirect(url('/voice/gather'));
+        return response($response)->header('Content-Type', 'text/xml');
+    }
+    
+    $product = $products->get($productIndex);
+    
+    // Guardar producto en contexto
+    $context->update(['product_id' => $product->id, 'step' => 'requesting_datetime']);
 
-    $response->say('Ha elegido ' . $product->name . '.');
-    $response->say('Por favor, ingrese fecha y hora en formato 24 horas, por ejemplo, 1 7 Diciembre a las 1 7 3 0.');
-    $gather = $response->gather(['input' => 'speech dtmf', 'timeout' => 5, 'action' => url('/voice/confirm')]);
-    $gather->say('Diga la fecha y hora, o márquela en el teclado.');
+    $response->say('Ha elegido ' . $product->name . '.', ['language' => 'es']);
+    $response->say('Para agendar su cita, ingrese la fecha deseada usando el teclado.', ['language' => 'es']);
+    $response->say('Por ejemplo, para el 20 de Diciembre, marque: 2, 0, 1, 2.', ['language' => 'es']);
+    
+    $gather = $response->gather([
+        'input' => 'dtmf', 
+        'numDigits' => 4, 
+        'action' => url('/voice/date'),
+        'timeout' => 10
+    ]);
+    $gather->say('Ingrese día y mes con 4 dígitos, o presione 9 para el próximo día disponible.', ['language' => 'es']);
+    $response->redirect(url('/voice/product'));
     return response($response)->header('Content-Type', 'text/xml');
 });
 
-// Confirmar y registrar cita (simplificado)
-Route::post('/voice/confirm', function () {
+// Procesar fecha y pedir hora
+Route::post('/voice/date', function () {
+    $callSid = request('CallSid');
+    $digits = request('Digits');
+    
+    $context = CallContext::where('call_sid', $callSid)->first();
     $response = new \Twilio\Twiml();
-
-    // Simplificación: asignar hora fija + ahora + duración
-    $product = Product::where('active', true)->first();
-    if (!$product) {
-        $response->say('No hay servicios disponibles.');
+    
+    // Si presiona 9, usar próximo día disponible
+    if ($digits === '9') {
+        $availabilityService = new AvailabilityService();
+        $product = $context->product;
+        $nextSlot = $availabilityService->findNextAvailableSlot(Carbon::now(), $product->duration_minutes);
+        
+        if (!$nextSlot) {
+            $response->say('Lo sentimos, no hay disponibilidad en los próximos 30 días.', ['language' => 'es']);
+            $response->say('Por favor contacte con nosotros directamente.', ['language' => 'es']);
+            $response->hangup();
+            return response($response)->header('Content-Type', 'text/xml');
+        }
+        
+        // Crear cita directamente
+        Appointment::create([
+            'customer_name' => 'Cliente',
+            'customer_phone' => $context->customer_phone,
+            'product_id' => $context->product_id,
+            'starts_at' => $nextSlot['start'],
+            'ends_at' => $nextSlot['end'],
+            'status' => 'scheduled',
+        ]);
+        
+        $context->delete();
+        
+        $response->say(
+            'Su cita ha sido agendada para el ' . 
+            $nextSlot['start']->locale('es')->isoFormat('D [de] MMMM [a las] H:mm') . '.', 
+            ['language' => 'es']
+        );
+        $response->say('Recibirá una confirmación por SMS. Gracias por su confianza.', ['language' => 'es']);
+        $response->hangup();
         return response($response)->header('Content-Type', 'text/xml');
     }
-    $start = Carbon::now()->addHour();
-    $end = (clone $start)->addMinutes($product->duration_minutes);
+    
+    // Parsear fecha (formato DDMM)
+    if (strlen($digits) !== 4) {
+        $response->say('Formato de fecha inválido. Intente nuevamente.', ['language' => 'es']);
+        $response->redirect(url('/voice/product'));
+        return response($response)->header('Content-Type', 'text/xml');
+    }
+    
+    $day = (int)substr($digits, 0, 2);
+    $month = (int)substr($digits, 2, 2);
+    $year = Carbon::now()->year;
+    
+    try {
+        $requestedDate = Carbon::create($year, $month, $day);
+        
+        // Si la fecha es pasada, asumir año siguiente
+        if ($requestedDate->isPast()) {
+            $requestedDate->addYear();
+        }
+        
+        // Validar día laboral
+        if ($requestedDate->isWeekend()) {
+            $response->say('La fecha seleccionada cae en fin de semana. No trabajamos sábados ni domingos.', ['language' => 'es']);
+            $response->say('Presione 9 para el próximo día disponible o ingrese otra fecha.', ['language' => 'es']);
+            $response->redirect(url('/voice/product'));
+            return response($response)->header('Content-Type', 'text/xml');
+        }
+        
+        $context->update(['requested_date' => $requestedDate->toDateString()]);
+        
+        $response->say(
+            'Fecha: ' . $requestedDate->locale('es')->isoFormat('D [de] MMMM [de] YYYY') . '.', 
+            ['language' => 'es']
+        );
+        $response->say('Ahora ingrese la hora deseada en formato de 24 horas.', ['language' => 'es']);
+        $response->say('Por ejemplo, para las 15:30, marque: 1, 5, 3, 0.', ['language' => 'es']);
+        
+        $gather = $response->gather([
+            'input' => 'dtmf', 
+            'numDigits' => 4, 
+            'action' => url('/voice/confirm'),
+            'timeout' => 10
+        ]);
+        $gather->say('Ingrese la hora con 4 dígitos.', ['language' => 'es']);
+        $response->redirect(url('/voice/date'));
+        
+    } catch (\Exception $e) {
+        $response->say('Fecha inválida. Por favor intente nuevamente.', ['language' => 'es']);
+        $response->redirect(url('/voice/product'));
+    }
+    
+    return response($response)->header('Content-Type', 'text/xml');
+});
 
-    Appointment::create([
-        'customer_name' => 'Cliente',
-        'customer_phone' => request('Caller') ?? 'unknown',
-        'product_id' => $product->id,
-        'starts_at' => $start,
-        'ends_at' => $end,
-        'status' => 'scheduled',
-    ]);
-
-    $response->say('Su cita ha sido agendada para ' . $start->format('d-m-Y H:i') . '. Gracias.');
-    $response->hangup();
+// Confirmar y registrar cita
+Route::post('/voice/confirm', function () {
+    $callSid = request('CallSid');
+    $digits = request('Digits');
+    
+    $context = CallContext::where('call_sid', $callSid)->first();
+    $response = new \Twilio\Twiml();
+    
+    // Parsear hora (formato HHMM)
+    if (strlen($digits) !== 4) {
+        $response->say('Formato de hora inválido. Intente nuevamente.', ['language' => 'es']);
+        $response->redirect(url('/voice/date'));
+        return response($response)->header('Content-Type', 'text/xml');
+    }
+    
+    $hour = (int)substr($digits, 0, 2);
+    $minute = (int)substr($digits, 2, 2);
+    
+    if ($hour < 0 || $hour > 23 || $minute < 0 || $minute > 59) {
+        $response->say('Hora inválida. Por favor ingrese una hora válida.', ['language' => 'es']);
+        $response->redirect(url('/voice/date'));
+        return response($response)->header('Content-Type', 'text/xml');
+    }
+    
+    try {
+        $product = $context->product;
+        $requestedDateTime = Carbon::parse($context->requested_date)->setTime($hour, $minute);
+        $endDateTime = $requestedDateTime->copy()->addMinutes($product->duration_minutes);
+        
+        // Validar horario de trabajo
+        if ($hour < 9 || $hour >= 19) {
+            $response->say('Lo sentimos, nuestro horario es de 9 de la mañana a 7 de la tarde.', ['language' => 'es']);
+            $response->say('Por favor elija una hora dentro del horario laboral.', ['language' => 'es']);
+            $response->redirect(url('/voice/date'));
+            return response($response)->header('Content-Type', 'text/xml');
+        }
+        
+        // Verificar disponibilidad
+        $availabilityService = new AvailabilityService();
+        
+        if (!$availabilityService->isSlotAvailable($requestedDateTime, $endDateTime)) {
+            $response->say('Lo sentimos, ese horario no está disponible.', ['language' => 'es']);
+            
+            // Ofrecer alternativas
+            $slots = $availabilityService->getAvailableSlots(
+                $context->requested_date, 
+                $product->duration_minutes
+            );
+            
+            if (!empty($slots)) {
+                $response->say('Horarios disponibles para ese día:', ['language' => 'es']);
+                foreach (array_slice($slots, 0, 3) as $slot) {
+                    $response->say($slot['display'], ['language' => 'es']);
+                }
+                $response->say('Por favor elija otro horario.', ['language' => 'es']);
+                $response->redirect(url('/voice/date'));
+            } else {
+                $response->say('No hay disponibilidad para ese día. Presione 9 para el próximo disponible.', ['language' => 'es']);
+                $response->redirect(url('/voice/product'));
+            }
+            
+            return response($response)->header('Content-Type', 'text/xml');
+        }
+        
+        // Crear la cita
+        Appointment::create([
+            'customer_name' => 'Cliente',
+            'customer_phone' => $context->customer_phone,
+            'product_id' => $context->product_id,
+            'starts_at' => $requestedDateTime,
+            'ends_at' => $endDateTime,
+            'status' => 'scheduled',
+        ]);
+        
+        // Limpiar contexto
+        $context->delete();
+        
+        $response->say(
+            'Perfecto. Su cita ha sido confirmada para el ' . 
+            $requestedDateTime->locale('es')->isoFormat('D [de] MMMM [a las] H:mm') . '.', 
+            ['language' => 'es']
+        );
+        $response->say('El servicio es ' . $product->name . ', con una duración de ' . $product->duration_minutes . ' minutos.', ['language' => 'es']);
+        $response->say('Recibirá una confirmación por SMS. Gracias por confiar en Contemporánea Estética.', ['language' => 'es']);
+        $response->hangup();
+        
+    } catch (\Exception $e) {
+        $response->say('Ha ocurrido un error al procesar su cita. Por favor intente nuevamente o contacte con nosotros.', ['language' => 'es']);
+        $response->redirect(url('/voice/incoming'));
+    }
+    
     return response($response)->header('Content-Type', 'text/xml');
 });
