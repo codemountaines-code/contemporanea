@@ -8,11 +8,19 @@ use App\Models\Appointment;
 use App\Models\CallContext;
 use App\Services\AvailabilityService;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
+use App\Services\AIAssistant;
 
 // Voice: llamada entrante - Seleccionar familia por voz o DTMF
 Route::match(['get', 'post'], '/voice/incoming', function () {
     $callSid = request('CallSid');
     $from = request('From');
+    
+    Log::info('📞 [INCOMING CALL]', [
+        'call_sid' => $callSid,
+        'from' => $from,
+        'timestamp' => now()->toIso8601String()
+    ]);
     
     if (!$callSid) {
         $response = new VoiceResponse();
@@ -27,16 +35,17 @@ Route::match(['get', 'post'], '/voice/incoming', function () {
     );
     
     $response = new VoiceResponse();
-    $response->say('Bienvenido a Contemporánea Estética.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
     $gather = $response->gather([
         'input' => 'speech dtmf',
-        'hints' => 'facial, faciales, manos, repetir, 1, 2, 0',
+        'language' => 'es-ES',
+        'speechModel' => 'phone_call',
+        'hints' => 'hola, cita, precio, facial, manos, preguntar, información, promociones, agendar, 1, 2',
         'action' => url('/voice/gather'),
-        'timeout' => 5,
+        'timeout' => 10,
         'speechTimeout' => 'auto'
     ]);
-    $gather->say('Diga facial o manos para elegir, o presione los números 1 y 2.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
-    $response->say('No se detectó elección. Intentando de nuevo.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
+    $gather->say('Hola, bienvenido a Estética Contemporánea, ¿en qué puedo ayudarte?', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
+    $response->say('No escuché respuesta, intentaré de nuevo.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
     $response->redirect(url('/voice/incoming'));
     return response($response)->header('Content-Type', 'text/xml');
 });
@@ -46,6 +55,23 @@ Route::match(['get', 'post'], '/voice/gather', function () {
     $callSid = request('CallSid');
     $digit = request('Digits');
     $speechResult = strtolower(trim(request('SpeechResult') ?? ''));
+
+    Log::info('📝 [SPEECH TRACE]', [
+        'call_sid' => $callSid,
+        'speech_raw' => request('SpeechResult'),
+        'speech_normalized' => $speechResult,
+        'confidence' => request('Confidence'),
+        'speech_language' => request('SpeechLanguage'),
+        'dtmf' => $digit,
+        'timestamp' => now()->toIso8601String(),
+    ]);
+    
+    Log::info('🎙️ [GATHER INPUT]', [
+        'call_sid' => $callSid,
+        'digits' => $digit,
+        'speech' => $speechResult,
+        'confidence' => request('Confidence')
+    ]);
     
     $context = CallContext::where('call_sid', $callSid)->first();
     $response = new VoiceResponse();
@@ -55,11 +81,13 @@ Route::match(['get', 'post'], '/voice/gather', function () {
     if ($digit === '0' || $speechResult === 'repetir') {
         $response->redirect(url('/voice/incoming'));
         return response($response)->header('Content-Type', 'text/xml');
-    } elseif ($digit === '1' || strpos($speechResult, 'facial') !== false) {
-        $family = 'facial';
-    } elseif ($digit === '2' || $speechResult === 'manos') {
-        $family = 'manos';
+    } elLog::warning('⚠️ [INVALID FAMILY]', ['call_sid' => $callSid, 'input' => $speechResult ?: $digit]);
+        $response->say('No entendí su selección. Por favor intente de nuevo.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
+        $response->redirect(url('/voice/incoming'));
+        return response($response)->header('Content-Type', 'text/xml');
     }
+    
+    Log::info('✅ [FAMILY SELECTED]', ['call_sid' => $callSid, 'family' => $family]);}
 
     if (!$family) {
         $response->say('No entendí su selección. Por favor intente de nuevo.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
@@ -102,6 +130,12 @@ Route::match(['get', 'post'], '/voice/product', function () {
     $digit = request('Digits');
     $speechResult = strtolower(trim(request('SpeechResult') ?? ''));
     
+    Log::info('🛍️ [PRODUCT SELECTION]', [
+        'call_sid' => $callSid,
+        'digits' => $digit,
+        'speech' => $speechResult
+    ]);
+    
     $context = CallContext::where('call_sid', $callSid)->first();
     $response = new VoiceResponse();
     
@@ -123,11 +157,19 @@ Route::match(['get', 'post'], '/voice/product', function () {
         foreach ($products as $p) {
             if (strpos($speechResult, strtolower($p->name)) !== false) {
                 $product = $p;
-                break;
-            }
-        }
+        Log::warning('⚠️ [INVALID PRODUCT]', ['call_sid' => $callSid, 'input' => $speechResult ?: $digit]);
+        $response->say('No entendí su selección. Por favor intente de nuevo.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
+        $response->redirect(url('/voice/gather'));
+        return response($response)->header('Content-Type', 'text/xml');
     }
     
+    Log::info('✅ [PRODUCT CONFIRMED]', [
+        'call_sid' => $callSid,
+        'product_id' => $product->id,
+        'product_name' => $product->name,
+        'price' => $product->price_cents / 100,
+        'duration' => $product->duration_minutes
+    ]);
     if (!$product) {
         $response->say('No entendí su selección. Por favor intente de nuevo.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
         $response->redirect(url('/voice/gather'));
@@ -150,7 +192,13 @@ Route::match(['get', 'post'], '/voice/product', function () {
     $gather->say('Diga la fecha o marque los dígitos del día y mes, o presione 9 para el próximo día disponible.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
     $response->redirect(url('/voice/product'));
     return response($response)->header('Content-Type', 'text/xml');
-});
+});Log::info('📅 [DATE REQUEST]', [
+        'call_sid' => $callSid,
+        'digits' => $digits,
+        'speech' => $speechResult
+    ]);
+    
+    
 
 // Procesar fecha
 Route::match(['get', 'post'], '/voice/date', function () {
@@ -163,24 +211,37 @@ Route::match(['get', 'post'], '/voice/date', function () {
     
     // Si presiona 9, usar próximo día disponible
     if ($digits === '9' || strpos($speechResult, 'próximo') !== false) {
+        Log::info('🔍 [NEXT AVAILABLE SLOT]', ['call_sid' => $callSid]);
         $availabilityService = new AvailabilityService();
         $product = $context->product;
         $nextSlot = $availabilityService->findNextAvailableSlot(Carbon::now(), $product->duration_minutes);
         
         if (!$nextSlot) {
+            Log::warning('❌ [NO AVAILABILITY]', ['call_sid' => $callSid, 'days_checked' => 30]);
             $response->say('Lo sentimos, no hay disponibilidad en los próximos 30 días.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
             $response->say('Por favor contacte con nosotros directamente.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
             $response->hangup();
             return response($response)->header('Content-Type', 'text/xml');
         }
         
-        Appointment::create([
+        $appointment = Appointment::create([
             'customer_name' => 'Cliente',
             'customer_phone' => $context->customer_phone,
             'product_id' => $context->product_id,
             'starts_at' => $nextSlot['start'],
             'ends_at' => $nextSlot['end'],
             'status' => 'scheduled',
+        ]);
+        
+        Log::info('✅ [APPOINTMENT CREATED]', [
+            'call_sid' => $callSid,
+            'appointment_id' => $appointment->id,
+            'customer_phone' => $context->customer_phone,
+            'product_id' => $context->product_id,
+            'product_name' => $product->name,
+            'starts_at' => $nextSlot['start']->toIso8601String(),
+            'ends_at' => $nextSlot['end']->toIso8601String(),
+            'auto_scheduled' => true
         ]);
         
         $context->delete();
@@ -240,13 +301,21 @@ Route::match(['get', 'post'], '/voice/date', function () {
     }
     
     if (!$requestedDate) {
+        Log::warning('⚠️ [INVALID DATE]', ['call_sid' => $callSid, 'input' => $speechResult ?: $digits]);
         $response->say('No entendí la fecha. Por favor intente nuevamente.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
         $response->redirect(url('/voice/product'));
         return response($response)->header('Content-Type', 'text/xml');
     }
     
+    Log::info('📅 [DATE PARSED]', [
+        'call_sid' => $callSid,
+        'date' => $requestedDate->toDateString(),
+        'day_name' => $requestedDate->locale('es')->dayName
+    ]);
+    
     // Validar día laboral
     if ($requestedDate->isWeekend()) {
+        Log::warning('⚠️ [WEEKEND DATE]', ['call_sid' => $callSid, 'date' => $requestedDate->toDateString()]);
         $response->say('La fecha seleccionada cae en fin de semana. No trabajamos sábados ni domingos.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
         $response->say('Por favor diga otra fecha.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
         $response->redirect(url('/voice/product'));
@@ -279,6 +348,12 @@ Route::match(['get', 'post'], '/voice/confirm', function () {
     $callSid = request('CallSid');
     $digits = request('Digits');
     $speechResult = strtolower(trim(request('SpeechResult') ?? ''));
+    
+    Log::info('⏰ [TIME REQUEST]', [
+        'call_sid' => $callSid,
+        'digits' => $digits,
+        'speech' => $speechResult
+    ]);
     
     $context = CallContext::where('call_sid', $callSid)->first();
     $response = new VoiceResponse();
@@ -313,10 +388,18 @@ Route::match(['get', 'post'], '/voice/confirm', function () {
     }
     
     if ($hour === null || $minute === null || $hour < 0 || $hour > 23 || $minute < 0 || $minute > 59) {
+        Log::warning('⚠️ [INVALID TIME]', ['call_sid' => $callSid, 'hour' => $hour, 'minute' => $minute]);
         $response->say('No entendí la hora o es inválida. Por favor intente nuevamente.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
         $response->redirect(url('/voice/date'));
         return response($response)->header('Content-Type', 'text/xml');
     }
+    
+    Log::info('⏰ [TIME PARSED]', [
+        'call_sid' => $callSid,
+        'hour' => $hour,
+        'minute' => $minute,
+        'formatted' => sprintf('%02d:%02d', $hour, $minute)
+    ]);
     
     try {
         $product = $context->product;
@@ -325,6 +408,7 @@ Route::match(['get', 'post'], '/voice/confirm', function () {
         
         // Validar horario de trabajo
         if ($hour < 9 || $hour >= 19) {
+            Log::warning('⚠️ [OUT OF HOURS]', ['call_sid' => $callSid, 'requested_hour' => $hour]);
             $response->say('Lo sentimos, nuestro horario es de 9 de la mañana a 7 de la tarde.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
             $response->say('Por favor elija una hora dentro del horario laboral.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
             $response->redirect(url('/voice/date'));
@@ -335,6 +419,11 @@ Route::match(['get', 'post'], '/voice/confirm', function () {
         $availabilityService = new AvailabilityService();
         
         if (!$availabilityService->isSlotAvailable($requestedDateTime, $endDateTime)) {
+            Log::warning('❌ [SLOT NOT AVAILABLE]', [
+                'call_sid' => $callSid,
+                'requested_datetime' => $requestedDateTime->toIso8601String(),
+                'duration' => $product->duration_minutes
+            ]);
             $response->say('Lo sentimos, ese horario no está disponible.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
             
             // Ofrecer alternativas
@@ -354,12 +443,7 @@ Route::match(['get', 'post'], '/voice/confirm', function () {
                 $response->say('No hay disponibilidad para ese día. Por favor intente otra fecha.', ['language' => 'es-ES', 'voice' => 'Polly.Lucia']);
                 $response->redirect(url('/voice/product'));
             }
-            
-            return response($response)->header('Content-Type', 'text/xml');
-        }
-        
-        // Crear la cita
-        Appointment::create([
+        $appointment = Appointment::create([
             'customer_name' => 'Cliente',
             'customer_phone' => $context->customer_phone,
             'product_id' => $context->product_id,
@@ -368,7 +452,28 @@ Route::match(['get', 'post'], '/voice/confirm', function () {
             'status' => 'scheduled',
         ]);
         
+        Log::info('✅ [APPOINTMENT CREATED]', [
+            'call_sid' => $callSid,
+            'appointment_id' => $appointment->id,
+            'customer_phone' => $context->customer_phone,
+            'product_id' => $context->product_id,
+            'product_name' => $product->name,
+            'starts_at' => $requestedDateTime->toIso8601String(),
+            'ends_at' => $endDateTime->toIso8601String(),
+            'status' => 'scheduled'nte',
+            'customer_phone' => $context->customer_phone,
+            'product_id' => $context->product_id,
+            'starts_at' => $requestedDateTime,
+            'ends_at' => $endDateTime,
+            'status' => 'scheduled',
+        ]);
+        
         $context->delete();
+        Log::error('❌ [APPOINTMENT ERROR]', [
+            'call_sid' => $callSid,
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ]);
         
         $response->say(
             'Perfecto. Su cita ha sido confirmada para el ' . 
